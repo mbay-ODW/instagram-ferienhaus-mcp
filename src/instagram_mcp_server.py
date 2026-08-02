@@ -4,6 +4,11 @@ Instagram MCP Server - A Model Context Protocol server for Instagram API integra
 
 This server provides tools, resources, and prompts for interacting with Instagram's Graph API,
 enabling AI applications to manage Instagram business accounts programmatically.
+
+HTTP transport + auth (``_run_http``) is adapted from the mbay-ODW signal-mcp /
+whatsapp-mcp servers: Streamable-HTTP + classic SSE, a static ``MCP_API_KEY``
+bearer and Authelia OIDC introspection, plus the RFC 9728/8414 OAuth discovery
+endpoints Claude.ai needs.
 """
 
 import asyncio
@@ -758,7 +763,11 @@ Please provide:
             logger.error("Failed to validate access token", error=str(e))
             sys.exit(1)
 
-        # Run the server
+        if self.settings.mcp_transport == "sse":
+            self._run_http()
+            return
+
+        # Run the server (stdio)
         async with stdio_server() as (read_stream, write_stream):
             await self.server.run(
                 read_stream,
@@ -772,6 +781,219 @@ Please provide:
                     ),
                 ),
             )
+
+    # --------------------------------------------------------------------------
+    # HTTP transport + auth (adapted from signal-mcp / whatsapp-mcp)
+    # --------------------------------------------------------------------------
+    def _run_http(self) -> None:
+        """Serve over Streamable-HTTP + classic SSE, guarded by MCP_API_KEY /
+        Authelia OIDC token introspection, with the OAuth discovery endpoints
+        Claude.ai needs to complete its connector auth flow."""
+        import contextlib
+        import logging
+        import os
+        import time
+        from collections.abc import AsyncIterator
+
+        import httpx as _httpx
+        import uvicorn
+        from mcp.server.sse import SseServerTransport
+        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+        from starlette.applications import Starlette
+        from starlette.middleware import Middleware
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse, Response
+        from starlette.routing import Mount, Route
+
+        realm = "instagram-mcp"
+        _server = self.server
+
+        _log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+        _level_int = getattr(logging, _log_level, logging.INFO)
+        logging.basicConfig(
+            level=_level_int,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            force=True,
+        )
+        logging.getLogger().setLevel(_level_int)
+        log = logging.getLogger(realm)
+        for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+            logging.getLogger(name).setLevel(_level_int)
+
+        mcp_api_key = os.getenv("MCP_API_KEY", "")
+        oidc_introspection_url = os.getenv("OIDC_INTROSPECTION_URL", "")
+        oidc_client_id = os.getenv("OIDC_CLIENT_ID", "")
+        oidc_client_secret = os.getenv("OIDC_CLIENT_SECRET", "")
+        oauth_issuer = os.getenv("OAUTH_ISSUER", "")
+        mcp_server_url = os.getenv("MCP_SERVER_URL", "")
+
+        auth_configured = bool(mcp_api_key) or all(
+            (oidc_introspection_url, oidc_client_id, oidc_client_secret)
+        )
+        if not auth_configured:
+            log.warning(
+                "[auth] NEITHER MCP_API_KEY NOR a complete OIDC triple configured — "
+                "ALL requests pass unauthenticated."
+            )
+
+        def _auth_preview(auth: str) -> str:
+            return "(none)" if not auth else auth[:20] + ("…" if len(auth) > 20 else "")
+
+        async def _is_authorized(request: Request) -> tuple[bool, Optional[str]]:
+            tag = f"{request.method} {request.url.path}"
+            auth = request.headers.get("Authorization", "")
+            if not mcp_api_key and not (
+                oidc_introspection_url and oidc_client_id and oidc_client_secret
+            ):
+                return True, None
+            if not auth:
+                log.warning("[auth] %s — DENY: no Authorization header", tag)
+                return False, "no_header"
+            if mcp_api_key and auth == f"Bearer {mcp_api_key}":
+                log.info("[auth] %s — OK: static MCP_API_KEY", tag)
+                return True, None
+            if not auth.startswith("Bearer "):
+                return False, "invalid_token"
+            if not (oidc_introspection_url and oidc_client_id and oidc_client_secret):
+                return False, "invalid_token"
+            jwt_token = auth[7:]
+            try:
+                async with _httpx.AsyncClient(timeout=5.0) as http:
+                    resp = await http.post(
+                        oidc_introspection_url,
+                        data={"token": jwt_token},
+                        auth=(oidc_client_id, oidc_client_secret),
+                    )
+                    if resp.status_code != 200:
+                        log.warning(
+                            "[auth] %s — DENY: introspection HTTP %s", tag, resp.status_code
+                        )
+                        return False, "invalid_token"
+                    if bool(resp.json().get("active")):
+                        log.info("[auth] %s — OK: OIDC token active", tag)
+                        return True, None
+                    return False, "invalid_token"
+            except Exception as e:
+                log.error("[auth] %s — introspection error: %s", tag, e)
+                return False, "invalid_token"
+
+        def _unauthorized(reason: Optional[str]) -> Response:
+            if reason == "invalid_token":
+                www = (
+                    f'Bearer realm="{realm}", error="invalid_token", '
+                    'error_description="The access token expired or is invalid"'
+                )
+                return Response(
+                    "Unauthorized", status_code=401, headers={"WWW-Authenticate": www}
+                )
+            return Response("Unauthorized", status_code=401)
+
+        class RequestLogMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):  # type: ignore[override]
+                t0 = time.monotonic()
+                log.debug(
+                    "→ %s %s auth=%s",
+                    request.method,
+                    request.url.path,
+                    _auth_preview(request.headers.get("Authorization", "")),
+                )
+                response = await call_next(request)
+                log.debug(
+                    "← %s %s → %d in %dms",
+                    request.method,
+                    request.url.path,
+                    response.status_code,
+                    int((time.monotonic() - t0) * 1000),
+                )
+                return response
+
+        sse = SseServerTransport("/messages/")
+        session_manager = StreamableHTTPSessionManager(app=_server, json_response=True)
+
+        class _AlreadySent(Response):
+            def __init__(self) -> None:
+                super().__init__(content=b"", status_code=200)
+
+            async def __call__(self, scope, receive, send):
+                return
+
+        async def handle_streamable_http(request: Request):
+            ok, reason = await _is_authorized(request)
+            if not ok:
+                return _unauthorized(reason)
+            await session_manager.handle_request(request.scope, request.receive, request._send)
+            return _AlreadySent()
+
+        @contextlib.asynccontextmanager
+        async def lifespan(_app: "Starlette") -> AsyncIterator[None]:
+            async with session_manager.run():
+                log.info("StreamableHTTPSessionManager started")
+                yield
+
+        async def handle_sse(request: Request):
+            ok, reason = await _is_authorized(request)
+            if not ok:
+                return _unauthorized(reason)
+            async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+                await _server.run(streams[0], streams[1], _server.create_initialization_options())
+            return Response()
+
+        async def handle_messages(scope, receive, send):
+            req = Request(scope, receive=receive)
+            ok, reason = await _is_authorized(req)
+            if not ok:
+                await _unauthorized(reason)(scope, receive, send)
+                return
+            await sse.handle_post_message(scope, receive, send)
+
+        async def handle_oauth_protected_resource(request: Request):
+            return JSONResponse({
+                "resource": mcp_server_url or str(request.base_url).rstrip("/"),
+                "authorization_servers": [oauth_issuer] if oauth_issuer else [],
+                "bearer_methods_supported": ["header"],
+                "scopes_supported": ["openid", "profile", "email"],
+            })
+
+        async def handle_oauth_authorization_server(request: Request):
+            if oauth_issuer:
+                try:
+                    async with _httpx.AsyncClient(timeout=5.0) as http:
+                        up = await http.get(f"{oauth_issuer}/.well-known/oauth-authorization-server")
+                        if up.status_code == 200:
+                            return JSONResponse(up.json())
+                except Exception as e:
+                    log.warning("[discovery] upstream fetch failed: %s", e)
+            return JSONResponse({
+                "issuer": oauth_issuer,
+                "authorization_endpoint": f"{oauth_issuer}/api/oidc/authorization",
+                "token_endpoint": f"{oauth_issuer}/api/oidc/token",
+                "jwks_uri": f"{oauth_issuer}/jwks.json",
+                "introspection_endpoint": f"{oauth_issuer}/api/oidc/introspection",
+                "response_types_supported": ["code"],
+                "grant_types_supported": ["authorization_code", "refresh_token"],
+                "code_challenge_methods_supported": ["S256"],
+                "scopes_supported": ["openid", "profile", "email"],
+            })
+
+        app = Starlette(
+            routes=[
+                Route("/.well-known/oauth-protected-resource",
+                      endpoint=handle_oauth_protected_resource, methods=["GET"]),
+                Route("/.well-known/oauth-authorization-server",
+                      endpoint=handle_oauth_authorization_server, methods=["GET"]),
+                Route("/sse", endpoint=handle_streamable_http, methods=["POST"]),
+                Route("/mcp", endpoint=handle_streamable_http, methods=["POST"]),
+                Route("/sse", endpoint=handle_sse, methods=["GET"]),
+                Mount("/messages/", app=handle_messages),
+            ],
+            middleware=[Middleware(RequestLogMiddleware)],
+            lifespan=lifespan,
+        )
+
+        port = int(os.getenv("PORT", "8000"))
+        log.info("%s listening on :%d (LOG_LEVEL=%s)", realm, port, _log_level)
+        uvicorn.run(app, host="0.0.0.0", port=port)
 
 
 async def main():

@@ -1,5 +1,8 @@
 version: '3.8'
 
+# Local reference compose file. Production runs as a Portainer-managed stack
+# on the TrueNAS host behind Traefik + Authelia (see README / deploy docs) —
+# this file mirrors that setup for local testing of the HTTP transport.
 services:
   instagram-mcp:
     build:
@@ -9,12 +12,19 @@ services:
     container_name: instagram-mcp-server
     restart: unless-stopped
     environment:
-      - ENVIRONMENT=development
       - LOG_LEVEL=DEBUG
       - CACHE_ENABLED=true
       - CACHE_TTL=300
       - RATE_LIMIT_CALLS_PER_HOUR=200
       - RATE_LIMIT_POSTS_PER_DAY=25
+      - MCP_TRANSPORT=sse
+      - PORT=8000
+      - MCP_API_KEY=${MCP_API_KEY}
+      - OIDC_CLIENT_ID=instagram-ferienhaus-mcp
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
+      - OAUTH_ISSUER=https://authelia.${DOMAIN}
+      - OIDC_INTROSPECTION_URL=https://instagram-ferienhaus-mcp.${DOMAIN}/api/oidc/introspection
+      - MCP_SERVER_URL=https://instagram-ferienhaus-mcp.${DOMAIN}
     env_file:
       - .env
     volumes:
@@ -32,47 +42,6 @@ services:
       retries: 3
       start_period: 40s
 
-  # Redis for caching (optional)
-  redis:
-    image: redis:7-alpine
-    container_name: instagram-mcp-redis
-    restart: unless-stopped
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    networks:
-      - mcp-network
-    command: redis-server --appendonly yes
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  # Monitoring with Prometheus (optional)
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: instagram-mcp-prometheus
-    restart: unless-stopped
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
-    networks:
-      - mcp-network
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-      - '--web.enable-lifecycle'
-
-volumes:
-  redis_data:
-  prometheus_data:
-
 networks:
   mcp-network:
-    driver: bridge 
+    driver: bridge

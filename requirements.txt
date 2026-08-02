@@ -2,6 +2,10 @@
 mcp>=1.0.0
 fastmcp>=0.1.0
 
+# HTTP transport (Streamable-HTTP/SSE + Authelia OIDC introspection)
+starlette>=0.46.0
+uvicorn>=0.34.0
+
 # HTTP client for Instagram API
 httpx>=0.25.0
 requests>=2.31.0

@@ -54,6 +54,11 @@ RUN mkdir -p logs cache && \
 # Switch to non-root user
 USER appuser
 
+# HTTP transport (Streamable-HTTP/SSE + Authelia OIDC) is the default in this
+# fork — set MCP_TRANSPORT=stdio to run as a local stdio subprocess instead.
+ENV MCP_TRANSPORT=sse
+ENV PORT=8000
+
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import src.config; print('Health check passed')" || exit 1
