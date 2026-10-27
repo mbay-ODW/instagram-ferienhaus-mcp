@@ -1,5 +1,5 @@
 # Core MCP dependencies
-mcp>=1.0.0
+mcp>=1.30.0,<2
 fastmcp>=0.1.0
 
 # HTTP transport (Streamable-HTTP/SSE + Authelia OIDC introspection)
